@@ -1,0 +1,13 @@
+[project]
+name = "project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.8",
+    "networkx>=3.6.1",
+    "pygraphviz>=1.14",
+    "torch>=2.10.0",
+]
