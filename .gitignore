@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Scripts
+evaluate_baselines.py
+plot_metrics.py
+baseline_metrics.csv
