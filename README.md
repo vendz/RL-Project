@@ -27,3 +27,8 @@ The performance comparison of the baseline metrics demonstrates clear improvemen
 ![Average Edge Crossings](assets/mean_crossings_bar.png)
 
 ![Crossings Distribution](assets/crossings_boxplot.png)
+
+## Documentation
+
+See the [`docs/`](docs/) directory for detailed documentation:
+- [Evaluation Metrics](docs/metrics.md) — SPC and other metrics used to compare models
