@@ -87,11 +87,15 @@ class GraphLayoutEnv:
         if init_coords is not None:
             self.coords = torch.tensor(init_coords, dtype=torch.float32)
         else:
-            pos = nx.nx_agraph.graphviz_layout(G, prog="neato")
-            nodes = sorted(G.nodes())
-            self.coords = torch.tensor(
-                [[pos[v][0], pos[v][1]] for v in nodes], dtype=torch.float32
-            )
+            try:
+                pos = nx.nx_agraph.graphviz_layout(G, prog="neato")
+                nodes = sorted(G.nodes())
+                self.coords = torch.tensor(
+                    [[pos[v][0], pos[v][1]] for v in nodes], dtype=torch.float32
+                )
+            except Exception:
+                # pygraphviz unavailable or neato failed — fall back to random layout
+                self.coords = torch.rand(n, 2, dtype=torch.float32) * 100.0
 
         with torch.no_grad():
             self.current_crossings = self.xing_loss(self.coords).item()

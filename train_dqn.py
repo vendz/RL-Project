@@ -35,8 +35,13 @@ from replay_buffer import ReplayBuffer
 def load_rome_graphs(rome_dir: str, start: int, end: int):
     """Load a slice of the Rome dataset, skipping degenerate graphs."""
     all_files = sorted(Path(rome_dir).glob("*.graphml"))
+    print(f"  Found {len(all_files)} total .graphml files in '{rome_dir}'")
+    slice_files = all_files[start:end]
+    print(f"  Reading files [{start}, {end}) — {len(slice_files)} files ...")
     graphs = []
-    for path in all_files[start:end]:
+    for i, path in enumerate(slice_files):
+        if i % 100 == 0:
+            print(f"    [{i}/{len(slice_files)}] loading {path.name} ...")
         G = nx.read_graphml(path)
         G = nx.convert_node_labels_to_integers(G, ordering="sorted")
         if G.number_of_nodes() >= 3 and G.number_of_edges() >= 2:
@@ -53,11 +58,13 @@ def train(args):
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
     print(f"Device: {device}")
+    print(f"PyTorch version: {torch.__version__}")
 
-    print(f"Loading Rome graphs [{args.train_start}, {args.train_end}) ...")
+    print(f"\n[1/4] Loading Rome graphs [{args.train_start}, {args.train_end}) ...")
     train_graphs = load_rome_graphs(args.rome_dir, args.train_start, args.train_end)
-    print(f"  {len(train_graphs)} graphs loaded")
+    print(f"  Done — {len(train_graphs)} usable graphs loaded")
 
+    print(f"\n[2/4] Building environment and agent ...")
     env    = GraphLayoutEnv(step_size=args.step_size, max_steps=args.max_steps)
     agent  = DQNAgent(
         feat_dim=7,
@@ -75,15 +82,26 @@ def train(args):
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
+    print(f"  Replay buffer capacity: {args.buffer_size}")
+    print(f"  Checkpoint dir: {args.checkpoint_dir}")
+    print(f"  Log dir:        {args.log_dir}")
+
+    print(f"\n[3/4] Warming up replay buffer (need {args.batch_size} transitions before training) ...")
 
     log_rows = []
     recent_improvements = deque(maxlen=args.log_interval)
     recent_rewards      = deque(maxlen=args.log_interval)
     total_steps = 0
+    training_started = False
 
+    print(f"\n[4/4] Starting training loop ({args.num_episodes} episodes) ...")
     for ep in range(args.num_episodes):
         G     = random.choice(train_graphs)
+        if ep < 5:
+            print(f"  Ep {ep}: resetting env (graph: {G.number_of_nodes()}n {G.number_of_edges()}e) ...", flush=True)
         state = env.reset(G)
+        if ep < 5:
+            print(f"  Ep {ep}: env reset done — initial crossings: {env.initial_crossings:.0f}", flush=True)
         ep_reward = 0.0
         loss_acc  = 0.0
         loss_cnt  = 0
@@ -101,6 +119,9 @@ def train(args):
             total_steps += 1
 
             if len(buffer) >= args.batch_size:
+                if not training_started:
+                    print(f"  Buffer full — gradient updates starting at ep {ep}, step {total_steps}", flush=True)
+                    training_started = True
                 batch = buffer.sample(args.batch_size)
                 loss  = agent.train_step(batch)
                 loss_acc += loss
@@ -144,7 +165,7 @@ def train(args):
     # Final save
     final_ckpt = os.path.join(args.checkpoint_dir, "dqn_final.pt")
     agent.save(final_ckpt)
-    print(f"Training complete. Final model → {final_ckpt}")
+    print(f"\nTraining complete. Final model → {final_ckpt}")
 
     pd.DataFrame(log_rows).to_csv(
         os.path.join(args.log_dir, "training_log.csv"), index=False
