@@ -106,12 +106,15 @@ def train(args):
         loss_acc  = 0.0
         loss_cnt  = 0
 
-        for _ in range(args.max_steps):
+        for _step in range(args.max_steps):
             action     = agent.select_action(state, training=True)
             node_idx   = action // env.num_dirs
             dir_idx    = action % env.num_dirs
 
             next_state, reward, done, info = env.step(action)
+
+            if total_steps % 50 == 0:
+                print(f"    step {_step+1}/{args.max_steps} | crossings: {info['crossings']:.0f} | reward: {reward:+.4f} | buffer: {len(buffer)}", flush=True)
 
             buffer.push(state, node_idx, dir_idx, reward, next_state, done)
             state      = next_state
@@ -188,7 +191,7 @@ def get_args():
     # Environment
     p.add_argument("--step-size",    type=float, default=5.0,
                    help="Pixels to move a node per action")
-    p.add_argument("--max-steps",    type=int,   default=100,
+    p.add_argument("--max-steps",    type=int,   default=50,
                    help="Max environment steps per episode")
 
     # Network

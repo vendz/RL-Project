@@ -34,7 +34,7 @@ python train_dqn.py \
     --train-start   0 \
     --train-end     500 \
     --num-episodes  5000 \
-    --max-steps     100 \
+    --max-steps     50 \
     --step-size     5.0 \
     --hidden-dim    128 \
     --lr            1e-3 \
