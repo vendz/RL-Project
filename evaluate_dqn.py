@@ -26,10 +26,14 @@ from metrics import spc
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_rome_graphs(rome_dir: str, start: int, end: int):
-    all_files = sorted(Path(rome_dir).glob("*.graphml"))
+def load_test_graphs(rome_dir: str, test_graphs_file: str):
+    """Load the held-out test graphs listed in *test_graphs_file*."""
+    rome_path = Path(rome_dir)
+    with open(test_graphs_file) as f:
+        filenames = [line.strip() for line in f if line.strip()]
     graphs = []
-    for path in all_files[start:end]:
+    for name in filenames:
+        path = rome_path / name
         G = nx.read_graphml(path)
         G = nx.convert_node_labels_to_integers(G, ordering="sorted")
         if G.number_of_nodes() >= 3 and G.number_of_edges() >= 2:
@@ -53,8 +57,8 @@ def evaluate(args):
     print(f"Loaded checkpoint: {args.checkpoint}  (epsilon={agent.epsilon:.3f})")
 
     # Load test graphs
-    test_graphs = load_rome_graphs(args.rome_dir, args.eval_start, args.eval_end)
-    print(f"Evaluating on {len(test_graphs)} test graphs ...")
+    test_graphs = load_test_graphs(args.rome_dir, args.test_graphs_file)
+    print(f"Evaluating on {len(test_graphs)} test graphs (from '{args.test_graphs_file}') ...")
 
     env = GraphLayoutEnv(step_size=args.step_size, max_steps=args.max_steps)
 
@@ -118,9 +122,9 @@ def evaluate(args):
 def get_args():
     p = argparse.ArgumentParser(description="Evaluate DQN on Rome test graphs")
     p.add_argument("--checkpoint",  required=True, help="Path to .pt checkpoint")
-    p.add_argument("--rome-dir",    default="rome")
-    p.add_argument("--eval-start",  type=int, default=10_000)
-    p.add_argument("--eval-end",    type=int, default=10_100)
+    p.add_argument("--rome-dir",         default="rome")
+    p.add_argument("--test-graphs-file", default="test_graphs.txt",
+                   help="File produced by train_dqn.py listing held-out test graphs")
     p.add_argument("--max-steps",   type=int, default=200)
     p.add_argument("--step-size",   type=float, default=5.0)
     p.add_argument("--hidden-dim",  type=int,   default=128)

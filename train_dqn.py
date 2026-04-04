@@ -5,9 +5,9 @@ Usage:
     python train_dqn.py [options]
 
 Key hyperparameters (with defaults):
-    --num-episodes 5000   total training episodes
-    --max-steps    100    environment steps per episode
-    --train-end    500    use first N graphs from Rome for training
+    --num-episodes 10000  total training episodes
+    --max-steps    50     environment steps per episode
+    --num-train    10000  graphs reserved for training (rest held out as test)
     --batch-size   32
     --step-size    5.0    pixels to move a node per action
 """
@@ -32,16 +32,33 @@ from replay_buffer import ReplayBuffer
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_rome_graphs(rome_dir: str, start: int, end: int):
-    """Load a slice of the Rome dataset, skipping degenerate graphs."""
+def load_and_split_rome_graphs(rome_dir: str, num_train: int, test_graphs_file: str):
+    """
+    Load all Rome graphs, shuffle with seed=42, split into train/test.
+    Writes test filenames to *test_graphs_file* for reproducible evaluation.
+    Returns only the train graphs (as NetworkX objects).
+    """
     all_files = sorted(Path(rome_dir).glob("*.graphml"))
     print(f"  Found {len(all_files)} total .graphml files in '{rome_dir}'")
-    slice_files = all_files[start:end]
-    print(f"  Reading files [{start}, {end}) — {len(slice_files)} files ...")
+
+    rng = random.Random(42)
+    shuffled = list(all_files)
+    rng.shuffle(shuffled)
+
+    train_files = shuffled[:num_train]
+    test_files  = shuffled[num_train:]
+
+    # Persist test split so evaluate_dqn.py uses the exact same graphs
+    with open(test_graphs_file, "w") as f:
+        for p in test_files:
+            f.write(p.name + "\n")
+    print(f"  Test split: {len(test_files)} files → saved to '{test_graphs_file}'")
+
+    print(f"  Loading {len(train_files)} training files ...")
     graphs = []
-    for i, path in enumerate(slice_files):
-        if i % 100 == 0:
-            print(f"    [{i}/{len(slice_files)}] loading {path.name} ...")
+    for i, path in enumerate(train_files):
+        if i % 500 == 0:
+            print(f"    [{i}/{len(train_files)}] loading {path.name} ...")
         G = nx.read_graphml(path)
         G = nx.convert_node_labels_to_integers(G, ordering="sorted")
         if G.number_of_nodes() >= 3 and G.number_of_edges() >= 2:
@@ -60,9 +77,11 @@ def train(args):
     print(f"Device: {device}")
     print(f"PyTorch version: {torch.__version__}")
 
-    print(f"\n[1/4] Loading Rome graphs [{args.train_start}, {args.train_end}) ...")
-    train_graphs = load_rome_graphs(args.rome_dir, args.train_start, args.train_end)
-    print(f"  Done — {len(train_graphs)} usable graphs loaded")
+    print(f"\n[1/4] Loading Rome graphs (train={args.num_train}, seed=42) ...")
+    train_graphs = load_and_split_rome_graphs(
+        args.rome_dir, args.num_train, args.test_graphs_file
+    )
+    print(f"  Done — {len(train_graphs)} usable training graphs loaded")
 
     print(f"\n[2/4] Building environment and agent ...")
     env    = GraphLayoutEnv(step_size=args.step_size, max_steps=args.max_steps)
@@ -183,10 +202,11 @@ def get_args():
     p = argparse.ArgumentParser(description="Train DQN for graph layout optimisation")
 
     # Data
-    p.add_argument("--rome-dir",     default="rome")
-    p.add_argument("--train-start",  type=int, default=0)
-    p.add_argument("--train-end",    type=int, default=500,
-                   help="Use graphs [train_start, train_end) for training")
+    p.add_argument("--rome-dir",         default="rome")
+    p.add_argument("--num-train",        type=int, default=10_000,
+                   help="Number of graphs reserved for training (rest = test)")
+    p.add_argument("--test-graphs-file", default="test_graphs.txt",
+                   help="File to write held-out test graph filenames")
 
     # Environment
     p.add_argument("--step-size",    type=float, default=5.0,
@@ -201,14 +221,15 @@ def get_args():
     p.add_argument("--lr",               type=float, default=1e-3)
     p.add_argument("--gamma",            type=float, default=0.99)
     p.add_argument("--epsilon-start",    type=float, default=1.0)
-    p.add_argument("--epsilon-end",      type=float, default=0.05)
-    p.add_argument("--epsilon-decay",    type=float, default=0.998)
+    p.add_argument("--epsilon-end",      type=float, default=0.01)
+    # 0.99954 ≈ 0.01^(1/10000): epsilon reaches 0.01 by episode 10000
+    p.add_argument("--epsilon-decay",    type=float, default=0.99954)
     p.add_argument("--target-update-freq", type=int, default=200)
     p.add_argument("--batch-size",       type=int,   default=32)
     p.add_argument("--buffer-size",      type=int,   default=50_000)
 
     # Training schedule
-    p.add_argument("--num-episodes",  type=int, default=5000)
+    p.add_argument("--num-episodes",  type=int, default=10_000)
     p.add_argument("--log-interval",  type=int, default=100)
     p.add_argument("--save-interval", type=int, default=1000)
 
