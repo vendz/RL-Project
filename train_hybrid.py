@@ -1,0 +1,372 @@
+"""
+Hybrid training script: gradient descent initialisation + DQN fine-tuning.
+
+Phase 1 (per episode):
+    Run `--gd-iterations` steps of Adam gradient descent on XingLoss (soft) +
+    StressLoss to obtain a good initial layout for the current graph.
+
+Phase 2 (per episode):
+    Hand the GD-optimised coordinates to GraphLayoutEnv and run DQN fine-tuning
+    from that starting layout.
+
+Extra CLI flags beyond train_dqn.py:
+    --gd-iterations   (default 100)   GD steps per episode
+    --gd-lr           (default 0.01)  Adam learning rate for GD phase
+    --resume-checkpoint PATH          load checkpoint and continue training
+                                      from the saved episode, epsilon, and
+                                      total_steps
+
+Checkpoints are saved every 1000 episodes as hybrid_ep<N>.pt and contain
+the full agent state plus episode number and total_steps so training can be
+resumed exactly.
+"""
+
+import argparse
+import os
+import random
+from collections import deque
+from pathlib import Path
+
+import networkx as nx
+import numpy as np
+import pandas as pd
+import torch
+
+from dqn_agent import DQNAgent
+from env import GraphLayoutEnv
+from replay_buffer import ReplayBuffer
+from stress import StressLoss
+from xing import XingLoss
+
+
+# ---------------------------------------------------------------------------
+# Graph loading (same logic as train_dqn.py)
+# ---------------------------------------------------------------------------
+
+def load_and_split_rome_graphs(rome_dir: str, num_train: int, test_graphs_file: str):
+    all_files = sorted(Path(rome_dir).glob("*.graphml"))
+    print(f"  Found {len(all_files)} total .graphml files in '{rome_dir}'")
+
+    rng = random.Random(42)
+    shuffled = list(all_files)
+    rng.shuffle(shuffled)
+
+    train_files = shuffled[:num_train]
+    test_files  = shuffled[num_train:]
+
+    with open(test_graphs_file, "w") as f:
+        for p in test_files:
+            f.write(p.name + "\n")
+    print(f"  Test split: {len(test_files)} files → saved to '{test_graphs_file}'")
+
+    print(f"  Loading {len(train_files)} training files ...")
+    graphs = []
+    for i, path in enumerate(train_files):
+        if i % 500 == 0:
+            print(f"    [{i}/{len(train_files)}] loading {path.name} ...")
+        G = nx.read_graphml(path)
+        G = nx.convert_node_labels_to_integers(G, ordering="sorted")
+        if G.number_of_nodes() >= 3 and G.number_of_edges() >= 2:
+            graphs.append(G)
+    return graphs
+
+
+# ---------------------------------------------------------------------------
+# Gradient-descent layout phase
+# ---------------------------------------------------------------------------
+
+def gd_layout(G: nx.Graph, num_iterations: int, lr: float, device: torch.device) -> np.ndarray:
+    """
+    Run gradient descent on XingLoss (soft) + StressLoss to produce an
+    initial node layout.
+
+    Returns:
+        coords_np: numpy [n, 2] of optimised positions.
+    """
+    n = G.number_of_nodes()
+
+    # Seed layout: try Graphviz neato, fall back to random
+    try:
+        pos = nx.nx_agraph.graphviz_layout(G, prog="neato")
+        nodes = sorted(G.nodes())
+        init = torch.tensor(
+            [[pos[v][0], pos[v][1]] for v in nodes], dtype=torch.float32
+        )
+    except Exception:
+        init = torch.rand(n, 2, dtype=torch.float32) * 100.0
+
+    coords = init.clone().detach().requires_grad_(True)
+
+    # Losses — XingLoss must be soft=True to be differentiable
+    xing_loss   = XingLoss(G, device=None, soft=True)
+    stress_loss = StressLoss(G, device=None)
+
+    optimizer = torch.optim.Adam([coords], lr=lr)
+
+    for _ in range(num_iterations):
+        optimizer.zero_grad()
+        loss = xing_loss(coords) + stress_loss(coords)
+        loss.backward()
+        optimizer.step()
+
+    return coords.detach().numpy()
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def save_hybrid_checkpoint(path: str, agent: DQNAgent, episode: int, total_steps: int) -> None:
+    """Save agent state plus training progress metadata."""
+    torch.save(
+        {
+            "q_net":        agent.q_net.state_dict(),
+            "q_target":     agent.q_target.state_dict(),
+            "optimizer":    agent.optimizer.state_dict(),
+            "epsilon":      agent.epsilon,
+            "update_count": agent._update_count,
+            "episode":      episode,
+            "total_steps":  total_steps,
+        },
+        path,
+    )
+
+
+def load_hybrid_checkpoint(path: str, agent: DQNAgent):
+    """
+    Load a hybrid checkpoint into *agent* in-place.
+
+    Returns:
+        start_episode (int): episode to resume from (next episode index)
+        total_steps   (int): cumulative environment steps so far
+    """
+    ckpt = torch.load(path, map_location=agent.device)
+    agent.q_net.load_state_dict(ckpt["q_net"])
+    agent.q_target.load_state_dict(ckpt["q_target"])
+    agent.optimizer.load_state_dict(ckpt["optimizer"])
+    agent.epsilon       = ckpt["epsilon"]
+    agent._update_count = ckpt["update_count"]
+    start_episode = ckpt.get("episode", 0) + 1  # resume from next episode
+    total_steps   = ckpt.get("total_steps", 0)
+    return start_episode, total_steps
+
+
+# ---------------------------------------------------------------------------
+# Main training loop
+# ---------------------------------------------------------------------------
+
+def train(args):
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+    )
+    print(f"Device: {device}")
+    print(f"PyTorch version: {torch.__version__}")
+
+    print(f"\n[1/4] Loading Rome graphs (train={args.num_train}, seed=42) ...")
+    train_graphs = load_and_split_rome_graphs(
+        args.rome_dir, args.num_train, args.test_graphs_file
+    )
+    print(f"  Done — {len(train_graphs)} usable training graphs loaded")
+
+    print(f"\n[2/4] Building environment and agent ...")
+    env   = GraphLayoutEnv(step_size=args.step_size, max_steps=args.max_steps)
+    agent = DQNAgent(
+        feat_dim=7,
+        num_dirs=8,
+        hidden_dim=args.hidden_dim,
+        lr=args.lr,
+        gamma=args.gamma,
+        epsilon_start=args.epsilon_start,
+        epsilon_end=args.epsilon_end,
+        epsilon_decay=args.epsilon_decay,
+        target_update_freq=args.target_update_freq,
+        device=device,
+    )
+    buffer = ReplayBuffer(capacity=args.buffer_size)
+
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+    print(f"  Replay buffer capacity: {args.buffer_size}")
+    print(f"  Checkpoint dir: {args.checkpoint_dir}")
+    print(f"  Log dir:        {args.log_dir}")
+    print(f"  GD iterations per episode: {args.gd_iterations}  lr: {args.gd_lr}")
+
+    # Optionally resume from checkpoint
+    start_episode = 0
+    total_steps   = 0
+    if args.resume_checkpoint:
+        print(f"\n  Resuming from checkpoint: {args.resume_checkpoint}")
+        start_episode, total_steps = load_hybrid_checkpoint(
+            args.resume_checkpoint, agent
+        )
+        print(f"  Resuming at episode {start_episode}, total_steps={total_steps}, "
+              f"ε={agent.epsilon:.4f}")
+
+    print(f"\n[3/4] Warming up replay buffer (need {args.batch_size} transitions) ...")
+
+    log_rows             = []
+    recent_improvements  = deque(maxlen=args.log_interval)
+    recent_rewards       = deque(maxlen=args.log_interval)
+    training_started     = False
+
+    print(f"\n[4/4] Starting hybrid training loop "
+          f"(episodes {start_episode}–{args.num_episodes - 1}) ...")
+
+    for ep in range(start_episode, args.num_episodes):
+        G = random.choice(train_graphs)
+
+        # ------------------------------------------------------------------
+        # Phase 1: gradient-descent layout
+        # ------------------------------------------------------------------
+        init_coords = gd_layout(G, args.gd_iterations, args.gd_lr, device)
+
+        # ------------------------------------------------------------------
+        # Phase 2: DQN fine-tuning from the GD layout
+        # ------------------------------------------------------------------
+        if ep < 5:
+            print(f"  Ep {ep}: resetting env (graph: {G.number_of_nodes()}n "
+                  f"{G.number_of_edges()}e) ...", flush=True)
+        state = env.reset(G, init_coords=init_coords)
+        if ep < 5:
+            print(f"  Ep {ep}: env reset done — initial crossings after GD: "
+                  f"{env.initial_crossings:.0f}", flush=True)
+
+        ep_reward = 0.0
+        loss_acc  = 0.0
+        loss_cnt  = 0
+
+        for _step in range(args.max_steps):
+            action   = agent.select_action(state, training=True)
+            node_idx = action // env.num_dirs
+            dir_idx  = action % env.num_dirs
+
+            next_state, reward, done, info = env.step(action)
+
+            if total_steps % 50 == 0:
+                print(
+                    f"    step {_step+1}/{args.max_steps} | "
+                    f"crossings: {info['crossings']:.0f} | "
+                    f"reward: {reward:+.4f} | "
+                    f"buffer: {len(buffer)}",
+                    flush=True,
+                )
+
+            buffer.push(state, node_idx, dir_idx, reward, next_state, done)
+            state      = next_state
+            ep_reward += reward
+            total_steps += 1
+
+            if len(buffer) >= args.batch_size:
+                if not training_started:
+                    print(
+                        f"  Buffer full — gradient updates starting at "
+                        f"ep {ep}, step {total_steps}",
+                        flush=True,
+                    )
+                    training_started = True
+                batch = buffer.sample(args.batch_size)
+                loss  = agent.train_step(batch)
+                loss_acc += loss
+                loss_cnt += 1
+
+            if done:
+                break
+
+        improvement = env.initial_crossings - env.current_crossings
+        recent_improvements.append(improvement)
+        recent_rewards.append(ep_reward)
+        agent.decay_epsilon()
+
+        log_rows.append({
+            "episode":           ep,
+            "initial_crossings": env.initial_crossings,
+            "final_crossings":   env.current_crossings,
+            "improvement":       improvement,
+            "episode_reward":    ep_reward,
+            "mean_loss":         loss_acc / max(1, loss_cnt),
+            "epsilon":           agent.epsilon,
+            "total_steps":       total_steps,
+        })
+
+        if (ep + 1) % args.log_interval == 0:
+            avg_imp = np.mean(recent_improvements)
+            avg_rew = np.mean(recent_rewards)
+            print(
+                f"Ep {ep+1:5d}/{args.num_episodes} | "
+                f"improvement {avg_imp:+6.2f} | "
+                f"reward {avg_rew:+7.3f} | "
+                f"ε {agent.epsilon:.3f} | "
+                f"steps {total_steps:7d}"
+            )
+
+        if (ep + 1) % 1000 == 0:
+            ckpt = os.path.join(args.checkpoint_dir, f"hybrid_ep{ep+1}.pt")
+            save_hybrid_checkpoint(ckpt, agent, ep, total_steps)
+            print(f"  Saved checkpoint → {ckpt}")
+
+    # Final save
+    final_ckpt = os.path.join(args.checkpoint_dir, "hybrid_final.pt")
+    save_hybrid_checkpoint(final_ckpt, agent, args.num_episodes - 1, total_steps)
+    print(f"\nTraining complete. Final model → {final_ckpt}")
+
+    pd.DataFrame(log_rows).to_csv(
+        os.path.join(args.log_dir, "hybrid_training_log.csv"), index=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def get_args():
+    p = argparse.ArgumentParser(
+        description="Hybrid GD + DQN training for graph layout optimisation"
+    )
+
+    # Data
+    p.add_argument("--rome-dir",         default="rome")
+    p.add_argument("--num-train",        type=int, default=10_000,
+                   help="Number of graphs reserved for training")
+    p.add_argument("--test-graphs-file", default="test_graphs.txt")
+
+    # Environment
+    p.add_argument("--step-size",  type=float, default=5.0)
+    p.add_argument("--max-steps",  type=int,   default=50)
+
+    # Network
+    p.add_argument("--hidden-dim", type=int, default=128)
+
+    # RL hyperparameters
+    p.add_argument("--lr",                 type=float, default=1e-3)
+    p.add_argument("--gamma",              type=float, default=0.99)
+    p.add_argument("--epsilon-start",      type=float, default=1.0)
+    p.add_argument("--epsilon-end",        type=float, default=0.01)
+    p.add_argument("--epsilon-decay",      type=float, default=0.99954)
+    p.add_argument("--target-update-freq", type=int,   default=200)
+    p.add_argument("--batch-size",         type=int,   default=32)
+    p.add_argument("--buffer-size",        type=int,   default=50_000)
+
+    # Training schedule
+    p.add_argument("--num-episodes",  type=int, default=10_000)
+    p.add_argument("--log-interval",  type=int, default=100)
+
+    # Hybrid-specific
+    p.add_argument("--gd-iterations", type=int,   default=100,
+                   help="Adam GD iterations for layout initialisation (Phase 1)")
+    p.add_argument("--gd-lr",         type=float, default=0.01,
+                   help="Adam learning rate for GD phase")
+    p.add_argument("--resume-checkpoint", default=None,
+                   help="Path to a hybrid checkpoint to resume training from")
+
+    # Paths
+    p.add_argument("--checkpoint-dir", default="checkpoints_hybrid")
+    p.add_argument("--log-dir",        default="logs_hybrid")
+
+    # Compute
+    p.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA available")
+
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    train(get_args())
