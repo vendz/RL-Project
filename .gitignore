@@ -12,3 +12,5 @@ wheels/
 # Scripts
 evaluate_baselines.py
 plot_metrics.py
+
+.claude/
