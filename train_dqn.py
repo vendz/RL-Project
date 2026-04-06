@@ -7,8 +7,7 @@ Usage:
 Key hyperparameters (with defaults):
     --num-episodes 10000  total training episodes
     --max-steps    50     environment steps per episode
-    --num-train    10000  graphs reserved for training (rest held out as test)
-    --batch-size   32
+--batch-size   32
     --step-size    5.0    pixels to move a node per action
 """
 
@@ -32,27 +31,30 @@ from replay_buffer import ReplayBuffer
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_and_split_rome_graphs(rome_dir: str, num_train: int, test_graphs_file: str):
+def _graph_number(path: Path) -> int:
+    """Extract the leading integer from a Rome filename (grafo{N}.{x}.graphml)."""
+    return int(path.stem.split(".")[0][len("grafo"):])
+
+
+def load_and_split_rome_graphs(rome_dir: str, test_graphs_file: str):
     """
-    Load all Rome graphs, shuffle with seed=42, split into train/test.
+    Split Rome graphs by filename number (spec-compliant):
+      train: graph number < 10000
+      test:  graph number 10000-10100
+
     Writes test filenames to *test_graphs_file* for reproducible evaluation.
     Returns only the train graphs (as NetworkX objects).
     """
     all_files = sorted(Path(rome_dir).glob("*.graphml"))
     print(f"  Found {len(all_files)} total .graphml files in '{rome_dir}'")
 
-    rng = random.Random(42)
-    shuffled = list(all_files)
-    rng.shuffle(shuffled)
+    train_files = [p for p in all_files if _graph_number(p) < 10000]
+    test_files  = [p for p in all_files if 10000 <= _graph_number(p) <= 10100]
 
-    train_files = shuffled[:num_train]
-    test_files  = shuffled[num_train:]
-
-    # Persist test split so evaluate_dqn.py uses the exact same graphs
     with open(test_graphs_file, "w") as f:
-        for p in test_files:
+        for p in sorted(test_files):
             f.write(p.name + "\n")
-    print(f"  Test split: {len(test_files)} files → saved to '{test_graphs_file}'")
+    print(f"  Test split: {len(test_files)} files (grafo10000–10100) → saved to '{test_graphs_file}'")
 
     print(f"  Loading {len(train_files)} training files ...")
     graphs = []
@@ -77,9 +79,9 @@ def train(args):
     print(f"Device: {device}")
     print(f"PyTorch version: {torch.__version__}")
 
-    print(f"\n[1/4] Loading Rome graphs (train={args.num_train}, seed=42) ...")
+    print(f"\n[1/4] Loading Rome graphs (train: grafo<10000, test: grafo10000-10100) ...")
     train_graphs = load_and_split_rome_graphs(
-        args.rome_dir, args.num_train, args.test_graphs_file
+        args.rome_dir, args.test_graphs_file
     )
     print(f"  Done — {len(train_graphs)} usable training graphs loaded")
 
@@ -203,10 +205,8 @@ def get_args():
 
     # Data
     p.add_argument("--rome-dir",         default="rome")
-    p.add_argument("--num-train",        type=int, default=10_000,
-                   help="Number of graphs reserved for training (rest = test)")
     p.add_argument("--test-graphs-file", default="test_graphs.txt",
-                   help="File to write held-out test graph filenames")
+                   help="File to write held-out test graph filenames (grafo10000-10100)")
 
     # Environment
     p.add_argument("--step-size",    type=float, default=5.0,
