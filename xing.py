@@ -4,8 +4,11 @@ import networkx as nx
 class XingLoss:
     def __init__(self, G: nx.Graph, device = None, soft = False, sharpness=10.0):
         # Store edges as a long tensor [num_edges, 2]
-        nodes = list(G.nodes())
-        edges = [[nodes.index(i), nodes.index(j)] for i,j in G.edges]
+        # Use sorted node order to match how coordinates are indexed everywhere
+        # (env.py and evaluate scripts all build coords as [pos[v] for v in sorted(G.nodes())])
+        nodes = sorted(G.nodes())
+        node_to_idx = {v: i for i, v in enumerate(nodes)}
+        edges = [[node_to_idx[i], node_to_idx[j]] for i, j in G.edges()]
         self.edges = torch.tensor(edges, dtype=torch.long)
         if device is None:
             device = torch.device("cpu")
