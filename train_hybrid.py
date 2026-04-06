@@ -81,6 +81,65 @@ def load_and_split_rome_graphs(rome_dir: str, test_graphs_file: str):
 
 
 # ---------------------------------------------------------------------------
+# Fast numpy crossing helpers (for SLS phase)
+# ---------------------------------------------------------------------------
+
+def _make_pairs(edge_arr):
+    E = len(edge_arr)
+    ii, jj = np.triu_indices(E, k=1)
+    ei, ej = edge_arr[ii], edge_arr[jj]
+    valid = ~((ei[:,0]==ej[:,0])|(ei[:,0]==ej[:,1])|(ei[:,1]==ej[:,0])|(ei[:,1]==ej[:,1]))
+    return ii[valid].astype(np.int32), jj[valid].astype(np.int32)
+
+def _count_crossings_np(coords, edge_arr, pi, pj):
+    if len(pi) == 0:
+        return 0
+    p1, p2 = coords[edge_arr[pi,0]], coords[edge_arr[pi,1]]
+    p3, p4 = coords[edge_arr[pj,0]], coords[edge_arr[pj,1]]
+    d1, d2 = p2-p1, p4-p3
+    cross = d1[:,0]*d2[:,1] - d1[:,1]*d2[:,0]
+    par = np.abs(cross) < 1e-10
+    sc = np.where(par, 1.0, cross)
+    qp = p3-p1
+    t = (qp[:,0]*d2[:,1] - qp[:,1]*d2[:,0]) / sc
+    u = (qp[:,0]*d1[:,1] - qp[:,1]*d1[:,0]) / sc
+    return int((~par & (t>0) & (t<1) & (u>0) & (u<1)).sum())
+
+def _incident_mask(node, edge_arr, pi, pj):
+    inc = (edge_arr[:,0]==node) | (edge_arr[:,1]==node)
+    return inc[pi] | inc[pj]
+
+def sls_layout(coords_np: np.ndarray, G: nx.Graph, num_iters: int = 50,
+               step_size: float = 5.0, rng=None) -> np.ndarray:
+    """Run SLS for num_iters iterations, sampling nodes by degree."""
+    if rng is None:
+        rng = np.random.default_rng()
+    edge_arr = np.array(list(G.edges()), dtype=np.int32)
+    nodes    = sorted(G.nodes())
+    pi, pj   = _make_pairs(edge_arr)
+    degs     = np.array([G.degree(v) for v in nodes], dtype=np.float32)
+    weights  = degs / degs.sum()
+    coords   = coords_np.copy()
+    cur      = _count_crossings_np(coords, edge_arr, pi, pj)
+    for _ in range(num_iters):
+        if cur == 0:
+            break
+        node  = rng.choice(len(nodes), p=weights)
+        mask  = _incident_mask(node, edge_arr, pi, pj)
+        pi_m, pj_m = pi[mask], pj[mask]
+        old_inc    = _count_crossings_np(coords, edge_arr, pi_m, pj_m)
+        for _ in range(16):
+            new_coords = coords.copy()
+            new_coords[node] += rng.uniform(-step_size, step_size, size=2).astype(np.float32)
+            new_inc = _count_crossings_np(new_coords, edge_arr, pi_m, pj_m)
+            if new_inc < old_inc:
+                coords = new_coords
+                cur    = cur - old_inc + new_inc
+                break
+    return coords
+
+
+# ---------------------------------------------------------------------------
 # Gradient-descent layout phase
 # ---------------------------------------------------------------------------
 
@@ -230,14 +289,21 @@ def train(args):
         init_coords = gd_layout(G, args.gd_iterations, args.gd_lr, device)
 
         # ------------------------------------------------------------------
-        # Phase 2: DQN fine-tuning from the GD layout
+        # Phase 2: SLS fine-tuning of the GD layout (matches eval pipeline)
+        # ------------------------------------------------------------------
+        init_coords = sls_layout(init_coords, G, num_iters=args.sls_iterations,
+                                 step_size=args.step_size)
+
+        # ------------------------------------------------------------------
+        # Phase 3: DQN fine-tuning from the GD+SLS layout
         # ------------------------------------------------------------------
         if ep < 5:
             print(f"  Ep {ep}: resetting env (graph: {G.number_of_nodes()}n "
                   f"{G.number_of_edges()}e) ...", flush=True)
         state = env.reset(G, init_coords=init_coords)
+        xing_soft_loss = XingLoss(G, device=None, soft=True)
         if ep < 5:
-            print(f"  Ep {ep}: env reset done — initial crossings after GD: "
+            print(f"  Ep {ep}: env reset done — initial crossings after GD+SLS: "
                   f"{env.initial_crossings:.0f}", flush=True)
 
         ep_reward = 0.0
@@ -249,7 +315,12 @@ def train(args):
             node_idx = action // env.num_dirs
             dir_idx  = action % env.num_dirs
 
+            with torch.no_grad():
+                soft_before = xing_soft_loss(env.coords).item()
             next_state, reward, done, info = env.step(action)
+            with torch.no_grad():
+                soft_after = xing_soft_loss(env.coords).item()
+            reward += 0.2 * (soft_before - soft_after)
 
             if total_steps % 50 == 0:
                 print(
@@ -308,7 +379,7 @@ def train(args):
                 f"steps {total_steps:7d}"
             )
 
-        if (ep + 1) % 1000 == 0:
+        if (ep + 1) % 100 == 0:
             ckpt = os.path.join(args.checkpoint_dir, f"hybrid_ep{ep+1}.pt")
             save_hybrid_checkpoint(ckpt, agent, ep, total_steps)
             print(f"  Saved checkpoint → {ckpt}")
@@ -359,10 +430,12 @@ def get_args():
     p.add_argument("--log-interval",  type=int, default=100)
 
     # Hybrid-specific
-    p.add_argument("--gd-iterations", type=int,   default=100,
+    p.add_argument("--gd-iterations",  type=int,   default=100,
                    help="Adam GD iterations for layout initialisation (Phase 1)")
-    p.add_argument("--gd-lr",         type=float, default=0.01,
+    p.add_argument("--gd-lr",          type=float, default=0.01,
                    help="Adam learning rate for GD phase")
+    p.add_argument("--sls-iterations", type=int,   default=50,
+                   help="SLS iterations after GD before handing off to DQN (Phase 2)")
     p.add_argument("--resume-checkpoint", default=None,
                    help="Path to a hybrid checkpoint to resume training from")
 
