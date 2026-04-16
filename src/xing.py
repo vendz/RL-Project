@@ -94,6 +94,38 @@ class XingLoss:
             return intersects_collinear | intersects_skew
 
     
+    def per_node_crossings(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Returns a tensor of shape [num_nodes] where each entry is the number of
+        crossings involving edges incident to that node.
+        """
+        num_edges = self.edges.shape[0]
+        num_nodes = coords.shape[0]
+        idx_i, idx_j = torch.triu_indices(num_edges, num_edges, offset=1)
+        edge_i = self.edges[idx_i]
+        edge_j = self.edges[idx_j]
+
+        no_shared = ~(
+            (edge_i[:, 0] == edge_j[:, 0]) | (edge_i[:, 0] == edge_j[:, 1]) |
+            (edge_i[:, 1] == edge_j[:, 0]) | (edge_i[:, 1] == edge_j[:, 1])
+        )
+        edge_i = edge_i[no_shared]
+        edge_j = edge_j[no_shared]
+
+        if edge_i.shape[0] == 0:
+            return torch.zeros(num_nodes, device=coords.device)
+
+        p1s = coords[edge_i[:, 0], :2]
+        p1e = coords[edge_i[:, 1], :2]
+        p2s = coords[edge_j[:, 0], :2]
+        p2e = coords[edge_j[:, 1], :2]
+
+        intersects = self.edges_intersect(p1s, p1e, p2s, p2e)
+        node_counts = torch.zeros(num_nodes, device=coords.device)
+        for col in [edge_i[:, 0], edge_i[:, 1], edge_j[:, 0], edge_j[:, 1]]:
+            node_counts.scatter_add_(0, col[intersects], torch.ones(intersects.sum(), device=coords.device))
+        return node_counts
+
     def __call__(self, coords: torch.Tensor) -> torch.Tensor:
         """
         coords: Tensor of shape [num_nodes, >=2], returns scalar total crossings
